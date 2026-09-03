@@ -408,17 +408,23 @@ class GaussianModel:
 
     def densify_from_depth_propagation(self, viewpoint_cam, propagated_depth, filter_mask, gt_image):
         # inverse project pixels into 3D scenes
-        K = viewpoint_cam.K
-        cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+        device = propagated_depth.device
+        K = viewpoint_cam.K.to(device)
+        cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse().to(device)
+        filter_mask = filter_mask.to(device)
+        gt_image = gt_image.to(device)
 
         # Get the shape of the depth image
         height, width = propagated_depth.shape
         # Create a grid of 2D pixel coordinates
-        y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
+        y, x = torch.meshgrid(
+            torch.arange(0, height, device=device),
+            torch.arange(0, width, device=device),
+        )
         # Stack the 2D and depth coordinates to create 3D homogeneous coordinates
-        coordinates = torch.stack([x.to(propagated_depth.device), y.to(propagated_depth.device), torch.ones_like(propagated_depth)], dim=-1)
+        coordinates = torch.stack([x, y, torch.ones_like(propagated_depth)], dim=-1)
         # Reshape the coordinates to (height * width, 3)
-        coordinates = coordinates.view(-1, 3).to(K.device).to(torch.float32)
+        coordinates = coordinates.view(-1, 3).to(torch.float32)
         # Reproject the 2D coordinates to 3D coordinates
         coordinates_3D = (K.inverse() @ coordinates.T).T
 
@@ -460,10 +466,10 @@ class GaussianModel:
         all_dist2 = torch.clamp_min(distCUDA2(all_point_cloud), 0.0000001)
         dist2 = all_dist2[:fused_shape]        
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device=device)
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(1.0 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(1.0 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device=device))
 
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         new_features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))

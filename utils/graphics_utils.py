@@ -97,25 +97,28 @@ def fov2focal(fov, pixels):
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
 
-def init_image_coord(height, width):
+def init_image_coord(height, width, device=None):
+    if device is None:
+        device = torch.device("cuda")
     x_row = np.arange(0, width)
     x = np.tile(x_row, (height, 1))
     x = x[np.newaxis, :, :]
     x = x.astype(np.float32)
-    x = torch.from_numpy(x.copy()).cuda()
+    x = torch.from_numpy(x.copy()).to(device)
     u_u0 = x - width/2.0
 
     y_col = np.arange(0, height)  # y_col = np.arange(0, height)
     y = np.tile(y_col, (width, 1)).T
     y = y[np.newaxis, :, :]
     y = y.astype(np.float32)
-    y = torch.from_numpy(y.copy()).cuda()
+    y = torch.from_numpy(y.copy()).to(device)
     v_v0 = y - height/2.0
     return u_u0, v_v0
 
 def depth_to_xyz(depth, intrinsic):
     b, c, h, w = depth.shape
-    u_u0, v_v0 = init_image_coord(h, w)
+    intrinsic = intrinsic.to(depth.device)
+    u_u0, v_v0 = init_image_coord(h, w, depth.device)
     x = (u_u0 - intrinsic[0][2]) * depth / intrinsic[0][0]
     y = (v_v0 - intrinsic[1][2]) * depth / intrinsic[1][1]
     z = depth
@@ -207,16 +210,18 @@ def surface_normal_from_depth(depth, intrinsic, valid_mask=None):
 
 def img_warping(ref_pose, src_pose, virtual_pose_ref_depth, virtual_intrinsic, src_img):
     ref_depth = virtual_pose_ref_depth
-    ref_pose = ref_pose
-    src_pose = src_pose
-    intrinsic = virtual_intrinsic
+    device = ref_depth.device
+    ref_pose = ref_pose.to(device)
+    src_pose = src_pose.to(device)
+    intrinsic = virtual_intrinsic.to(device)
+    src_img = src_img.to(device)
 
     mask = ref_depth > 0
 
     ht, wd = ref_depth.shape
     fx, fy, cx, cy = intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2]
 
-    y, x = torch.meshgrid(torch.arange(ht).float(), torch.arange(wd).float())
+    y, x = torch.meshgrid(torch.arange(ht, device=device).float(), torch.arange(wd, device=device).float())
     y = y.to(ref_depth.device)
     x = x.to(ref_depth.device)
 
@@ -329,7 +334,14 @@ def bilinear_sampler(img, coords, mask=False):
 # project the reference point cloud into the source view, then project back
 #extrinsics here refers c2w
 def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src):
+    device = depth_ref.device
+    intrinsics_ref = intrinsics_ref.to(device)
+    extrinsics_ref = extrinsics_ref.to(device)
+    depth_src = depth_src.to(device)
+    intrinsics_src = intrinsics_src.to(device)
+    extrinsics_src = extrinsics_src.to(device)
     batch, height, width = depth_ref.shape
+    source_height, source_width = depth_src.shape[-2:]
     
     ## step1. project reference pixels to the source view
     # reference view x, y
@@ -356,7 +368,10 @@ def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, i
     y_src = xy_src[:, 1].reshape([batch, height, width]).float()
 
     # print(x_src, y_src)
-    sampled_depth_src = bilinear_sampler(depth_src.view(batch, 1, height, width), torch.stack((x_src, y_src), dim=-1).view(batch, height, width, 2))
+    sampled_depth_src = bilinear_sampler(
+        depth_src.view(batch, 1, source_height, source_width),
+        torch.stack((x_src, y_src), dim=-1).view(batch, height, width, 2),
+    )
 
     # source 3D space
     # NOTE that we should use sampled source-view depth_here to project back
@@ -409,8 +424,26 @@ def depth_propagation(viewpoint_cam, rendered_depth, viewpoint_stack, src_idxs, 
     intrinsics = list()
     poses = list()
     depth_intervals = list()
+
+    # Propagation stacks all images, so normalize minor source-image size
+    # differences while keeping the original top-left pixel coordinates.
+    target_height = int(rendered_depth.shape[-2])
+    target_width = int(rendered_depth.shape[-1])
+
+    def propagation_image(camera):
+        image = (camera.original_image * 255).permute((1, 2, 0)).to(torch.uint8)
+        image = image[:target_height, :target_width]
+        pad_height = target_height - image.shape[0]
+        pad_width = target_width - image.shape[1]
+        if pad_height > 0 or pad_width > 0:
+            image = torch.nn.functional.pad(
+                image.permute((2, 0, 1)).unsqueeze(0),
+                (0, pad_width, 0, pad_height),
+                mode="replicate",
+            ).squeeze(0).permute((1, 2, 0))
+        return image
     
-    images.append((viewpoint_cam.original_image * 255).permute((1, 2, 0)).to(torch.uint8))
+    images.append(propagation_image(viewpoint_cam))
     intrinsics.append(viewpoint_cam.K)
     poses.append(viewpoint_cam.world_view_transform.transpose(0, 1))
     depth_interval = torch.tensor([depth_min, (depth_max-depth_min)/192.0, 192.0, depth_max])
@@ -421,7 +454,7 @@ def depth_propagation(viewpoint_cam, rendered_depth, viewpoint_stack, src_idxs, 
     
     for idx, src_idx in enumerate(src_idxs):
         src_viewpoint = viewpoint_stack[src_idx]
-        images.append((src_viewpoint.original_image * 255).permute((1, 2, 0)).to(torch.uint8))
+        images.append(propagation_image(src_viewpoint))
         intrinsics.append(src_viewpoint.K)
         poses.append(src_viewpoint.world_view_transform.transpose(0, 1))
         depth_intervals.append(depth_interval)
@@ -440,8 +473,9 @@ def depth_propagation(viewpoint_cam, rendered_depth, viewpoint_stack, src_idxs, 
     
 def generate_edge_mask(propagated_depth, patch_size):
     # img gradient
-    x_conv = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3).float().cuda()
-    y_conv = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3).float().cuda()
+    device = propagated_depth.device
+    x_conv = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device).view(1, 1, 3, 3).float()
+    y_conv = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device).view(1, 1, 3, 3).float()
     gradient_x = torch.abs(torch.nn.functional.conv2d(propagated_depth.unsqueeze(0).unsqueeze(0), x_conv, padding=1))
     gradient_y = torch.abs(torch.nn.functional.conv2d(propagated_depth.unsqueeze(0).unsqueeze(0), y_conv, padding=1))
     gradient = gradient_x + gradient_y
@@ -450,7 +484,7 @@ def generate_edge_mask(propagated_depth, patch_size):
     edge_mask = (gradient > 5).float()
 
     # dilation
-    kernel = torch.ones(1, 1, patch_size, patch_size).float().cuda()
+    kernel = torch.ones(1, 1, patch_size, patch_size, device=device).float()
     dilated_mask = torch.nn.functional.conv2d(edge_mask, kernel, padding=(patch_size-1)//2)
     dilated_mask = torch.round(dilated_mask).squeeze().to(torch.bool)
     dilated_mask = ~dilated_mask
